@@ -22,12 +22,130 @@ set -f  # Disable globbing
 BUZZHEAVIER_LOCATION_ID="12brteedoy0f"
 
 # Check for dependencies
-for cmd in curl jq; do
+for cmd in curl jq bc; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "ERROR: $cmd is required. Please install it." >&2
         exit 1
     fi
 done
+
+# Function to format file size
+format_size() {
+    local size=$1
+    if [ "$size" -ge 1073741824 ]; then
+        echo "$(echo "scale=2; $size/1073741824" | bc)GB"
+    elif [ "$size" -ge 1048576 ]; then
+        echo "$(echo "scale=2; $size/1048576" | bc)MB"
+    elif [ "$size" -ge 1024 ]; then
+        echo "$(echo "scale=2; $size/1024" | bc)KB"
+    else
+        echo "${size}B"
+    fi
+}
+
+# Function to display progress
+display_progress() {
+    local service=$1
+    local temp_log=$2
+    local file_size=$3      # File size in bytes
+    local formatted_size=$4 # Formatted file size
+    local start_time=$(date +%s.%N)
+    local last_update_time=$start_time
+    local displayed_once=false
+    local min_display_time=1.5  # Minimum display time in seconds
+    local transferred_bytes=0
+    local last_bytes=0
+    local counter=0
+    
+    # Process is running in background, display progress until it completes
+    echo -ne "Uploading to $service [0.00KB/s - 0B/$formatted_size - 0%]     "
+    
+    while [ -f "$temp_log.progress" ]; do
+        # Check if log file exists and read it
+        if [ -f "$temp_log" ]; then
+            # Get progress from curl output
+            # Different approach to parse curl output more reliably
+            local curl_output=$(cat "$temp_log")
+            
+            # First try to get progress percentage
+            local progress_percent=$(echo "$curl_output" | grep -o '[0-9]\+\.[0-9]\+%' | tail -n 1 | sed 's/%//')
+            if [ -z "$progress_percent" ]; then
+                progress_percent=$(echo "$curl_output" | grep -o '[0-9]\+%' | tail -n 1 | sed 's/%//')
+            fi
+            
+            # Calculate bytes transferred based on file size and percentage
+            if [ -n "$progress_percent" ] && [ -n "$file_size" ]; then
+                transferred_bytes=$(echo "scale=0; $file_size * $progress_percent / 100" | bc)
+                local progress_int=$(echo "$progress_percent / 1" | bc)
+                
+                # Calculate speed based on bytes transferred since last update
+                local current_time=$(date +%s.%N)
+                local time_diff=$(echo "$current_time - $last_update_time" | bc)
+                
+                # Only calculate speed if enough time has passed (avoid division by near-zero)
+                if [ "$(echo "$time_diff > 0.5" | bc)" -eq 1 ]; then
+                    local bytes_diff=$(echo "$transferred_bytes - $last_bytes" | bc)
+                    local speed_bps=$(echo "scale=2; $bytes_diff / $time_diff" | bc)
+                    local speed_str=$(format_speed "$speed_bps")
+                    
+                    # Format transferred size
+                    local transferred_str=$(format_size "$transferred_bytes")
+                    
+                    # Update the display
+                    echo -ne "\rUploading to $service [$speed_str - $transferred_str/$formatted_size - ${progress_int}%]     "
+                    
+                    # Update tracking variables
+                    last_bytes=$transferred_bytes
+                    last_update_time=$current_time
+                    displayed_once=true
+                fi
+            # If we can't get progress, but have a log file, show something
+            elif [ ! "$displayed_once" = true ] || [ "$((counter % 10))" -eq 0 ]; then
+                # Calculate time elapsed
+                local current_time=$(date +%s.%N)
+                local elapsed=$(echo "$current_time - $start_time" | bc)
+                elapsed_int=$(echo "$elapsed / 1" | bc)
+                
+                # Check if we can read the log file size
+                local log_size=$(stat -c %s "$temp_log" 2>/dev/null || echo "0")
+                
+                # If log file has content, we're making progress
+                if [ "$log_size" -gt 10 ]; then
+                    # Update with time-based status
+                    echo -ne "\rUploading to $service [Active - ${elapsed_int}s elapsed - Uploading]     "
+                else
+                    # Show minimal status
+                    echo -ne "\rUploading to $service [Starting - Connecting...]     "
+                fi
+            fi
+        fi
+        
+        counter=$((counter + 1))
+        sleep 0.2
+    done
+    
+    # Ensure minimum display time for small files
+    local end_time=$(date +%s.%N)
+    local total_time=$(echo "$end_time - $start_time" | bc)
+    if [ "$(echo "$total_time < $min_display_time" | bc)" -eq 1 ]; then
+        local remaining=$(echo "$min_display_time - $total_time" | bc)
+        sleep "$remaining"
+    fi
+    
+    echo -e "\rUploading to $service [Complete]                                     "
+}
+
+# Function to format speed
+format_speed() {
+    local bytes_per_sec=$1
+    if [ "$(echo "$bytes_per_sec >= 1073741824" | bc)" -eq 1 ]; then
+        echo "$(echo "scale=2; $bytes_per_sec/1073741824" | bc)GB/s"
+    elif [ "$(echo "$bytes_per_sec >= 1048576" | bc)" -eq 1 ]; then
+        echo "$(echo "scale=2; $bytes_per_sec/1048576" | bc)MB/s"
+    else
+        echo "$(echo "scale=2; $bytes_per_sec/1024" | bc)KB/s"
+    fi
+}
 
 # Parse arguments
 USE_RANDOM_FILENAME=false
@@ -90,7 +208,6 @@ for input_file in "$@"; do
     fi
     
     # --- GOFILE UPLOAD ---
-    echo -n "Uploading to Gofile... " >&2
     
     # Create anonymous Gofile session
     gofile_account_json=$(curl -s -X POST "https://api.gofile.io/accounts")
@@ -116,14 +233,32 @@ for input_file in "$@"; do
          -d '{"attribute":"public","attributeValue":"true"}' \
          "https://api.gofile.io/contents/$gofile_folder_id/update" > /dev/null
     
-    # Upload file
-    gofile_upload_url="https://$gofile_server.gofile.io/contents/uploadFile"
-    gofile_upload_json=$(curl -s -X POST -H "Authorization: Bearer $gofile_token" \
-                         -H "Referer: https://gofile.io/" \
-                         -F "file=@$upload_file" \
-                         -F "folderId=$gofile_folder_id" \
-                         "$gofile_upload_url")
+    # Create temp files for progress tracking
+    gofile_progress_log=$(mktemp -p /tmp uploadem-gofile-XXXXXX.log)
+    touch "${gofile_progress_log}.progress"
     
+    # Get file size in bytes
+    file_size=$(stat -c %s "$upload_file")
+    formatted_size=$(format_size "$file_size")
+    
+    # Upload file with progress
+    gofile_upload_url="https://$gofile_server.gofile.io/contents/uploadFile"
+    (
+        # Use stdbuf to ensure output is not buffered
+        curl --no-buffer -# -X POST -H "Authorization: Bearer $gofile_token" \
+             -H "Referer: https://gofile.io/" \
+             -F "file=@$upload_file" \
+             -F "folderId=$gofile_folder_id" \
+             "$gofile_upload_url" 2> "$gofile_progress_log" | tee "${gofile_progress_log}.json" > /dev/null
+        rm -f "${gofile_progress_log}.progress"
+    ) &
+    
+    # Display progress
+    display_progress "Gofile" "$gofile_progress_log" "$file_size" "$formatted_size" >&2
+    
+    # Wait for upload to complete and process response
+    wait
+    gofile_upload_json=$(cat "${gofile_progress_log}.json")
     gofile_status=$(echo "$gofile_upload_json" | jq -r '.status')
     
     if [ "$gofile_status" != "ok" ]; then
@@ -131,14 +266,30 @@ for input_file in "$@"; do
     else
         gofile_link=$(echo "$gofile_upload_json" | jq -r '.data.downloadPage')
     fi
-    echo "Done" >&2
+    
+    # Clean up temp files
+    rm -f "$gofile_progress_log" "${gofile_progress_log}.json"
     
     # --- BUZZHEAVIER UPLOAD ---
-    echo -n "Uploading to BuzzHeavier... " >&2
     
-    # Upload to BuzzHeavier
+    # Create temp files for progress tracking
+    buzz_progress_log=$(mktemp -p /tmp uploadem-buzz-XXXXXX.log)
+    touch "${buzz_progress_log}.progress"
+    
+    # Upload to BuzzHeavier with progress
     buzz_url="https://w.buzzheavier.com/$(basename "$upload_file")?locationId=$BUZZHEAVIER_LOCATION_ID"
-    buzz_response=$(curl -s -T "$upload_file" "$buzz_url")
+    (
+        # Use stdbuf to ensure output is not buffered
+        curl --no-buffer -# -T "$upload_file" "$buzz_url" 2> "$buzz_progress_log" | tee "${buzz_progress_log}.json" > /dev/null
+        rm -f "${buzz_progress_log}.progress"
+    ) &
+    
+    # Display progress
+    display_progress "BuzzHeavier" "$buzz_progress_log" "$file_size" "$formatted_size" >&2
+    
+    # Wait for upload to complete and process response
+    wait
+    buzz_response=$(cat "${buzz_progress_log}.json")
     
     if echo "$buzz_response" | grep -qi 'error\|denied\|fail'; then
         buzz_link="[BUZZHEAVIER UPLOAD FAILED]"
@@ -152,7 +303,9 @@ for input_file in "$@"; do
     else
         buzz_link="[BUZZHEAVIER UNKNOWN RESPONSE]"
     fi
-    echo "Done" >&2
+    
+    # Clean up temp files
+    rm -f "$buzz_progress_log" "${buzz_progress_log}.json"
     
     # Clean up temp file if one was created
     if [ -n "$temp_file" ] && [ -f "$temp_file" ]; then
