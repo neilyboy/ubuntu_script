@@ -29,6 +29,22 @@ for cmd in curl jq bc; do
     fi
 done
 
+# Function to URL encode a string
+urlencode() {
+    local string="$1"
+    local length=${#string}
+    local char
+
+    for (( i = 0; i < length; i++ )); do
+        char=${string:$i:1}
+        if [[ "$char" =~ [a-zA-Z0-9.~_-] ]]; then
+            printf "%s" "$char"
+        else
+            printf '%%%02X' "'$char"
+        fi
+    done
+}
+
 # Function to format file size
 format_size() {
     local size=$1
@@ -243,11 +259,14 @@ for input_file in "$@"; do
     
     # Upload file with progress
     gofile_upload_url="https://$gofile_server.gofile.io/contents/uploadFile"
+    
     (
         # Use stdbuf to ensure output is not buffered
+        # Use the @ form correctly with proper escaping for files with spaces/special chars
+        # The key is escaping the @ character properly with quotes around the entire parameter
         curl --no-buffer -# -X POST -H "Authorization: Bearer $gofile_token" \
              -H "Referer: https://gofile.io/" \
-             -F "file=@$upload_file" \
+             -F "file=@\"$upload_file\"" \
              -F "folderId=$gofile_folder_id" \
              "$gofile_upload_url" 2> "$gofile_progress_log" | tee "${gofile_progress_log}.json" > /dev/null
         rm -f "${gofile_progress_log}.progress"
@@ -277,7 +296,9 @@ for input_file in "$@"; do
     touch "${buzz_progress_log}.progress"
     
     # Upload to BuzzHeavier with progress
-    buzz_url="https://w.buzzheavier.com/$(basename "$upload_file")?locationId=$BUZZHEAVIER_LOCATION_ID"
+    # URL encode the filename to handle spaces and special characters
+    encoded_filename=$(urlencode "$(basename "$upload_file")")
+    buzz_url="https://w.buzzheavier.com/${encoded_filename}?locationId=$BUZZHEAVIER_LOCATION_ID"
     (
         # Use stdbuf to ensure output is not buffered
         curl --no-buffer -# -T "$upload_file" "$buzz_url" 2> "$buzz_progress_log" | tee "${buzz_progress_log}.json" > /dev/null
