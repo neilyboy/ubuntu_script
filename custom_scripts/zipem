@@ -1,0 +1,163 @@
+#!/bin/bash
+# ----------------------------------------------------------------------
+# zipem - Quick archive creator for multiple directories
+# ----------------------------------------------------------------------
+# Created: $(date +"%Y-%m-%d")
+# Author: Cascade AI Assistant
+# ----------------------------------------------------------------------
+# Description:
+#   This script creates individual ZIP archives for each directory in the
+#   current working directory, with zero compression for speed.
+#
+# Usage:
+#   zipem [options]
+#
+# Options:
+#   -c, --compress       Use compression (slower but smaller archives)
+#   -h, --help           Display this help message
+#   -v, --verbose        Show detailed progress
+#   -f, --format FORMAT  Specify archive format (zip, tar, tgz)
+#                        Default: zip
+# ----------------------------------------------------------------------
+
+# Default settings
+VERBOSE=false
+COMPRESS=false
+FORMAT="zip"
+
+# Process command line arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--compress)
+            COMPRESS=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: zipem [options]"
+            echo ""
+            echo "Creates individual archives for each directory in the current working directory."
+            echo ""
+            echo "Options:"
+            echo "  -c, --compress       Use compression (slower but smaller archives)"
+            echo "  -h, --help           Display this help message"
+            echo "  -v, --verbose        Show detailed progress"
+            echo "  -f, --format FORMAT  Specify archive format (zip, tar, tgz)"
+            echo "                      Default: zip"
+            echo ""
+            exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -f|--format)
+            FORMAT="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# Check for valid format
+case "$FORMAT" in
+    zip)
+        # Check if zip command is available
+        if ! command -v zip &> /dev/null; then
+            echo "Error: 'zip' command not found. Please install it with 'sudo apt install zip'."
+            exit 1
+        fi
+        ;;
+    tar)
+        # Check if tar command is available
+        if ! command -v tar &> /dev/null; then
+            echo "Error: 'tar' command not found. Please install it with 'sudo apt install tar'."
+            exit 1
+        fi
+        ;;
+    tgz)
+        # Check if tar command is available
+        if ! command -v tar &> /dev/null; then
+            echo "Error: 'tar' command not found. Please install it with 'sudo apt install tar'."
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Error: Unsupported format '$FORMAT'. Supported formats are: zip, tar, tgz"
+        exit 1
+        ;;
+esac
+
+# Count directories for progress tracking
+total_dirs=$(find . -maxdepth 1 -type d | grep -v "^\.$" | wc -l)
+current=0
+
+# Display start message
+echo "Creating archives for $total_dirs directories in $(pwd)"
+echo "Format: $FORMAT | Compression: $COMPRESS"
+echo "----------------------------------------------"
+
+# Process each directory
+find . -maxdepth 1 -type d | grep -v "^\.$" | while read -r dir; do
+    # Get directory name without leading './'
+    dirname=$(basename "$dir")
+    current=$((current + 1))
+    
+    # Display progress
+    if [ "$VERBOSE" = true ]; then
+        echo "[$current/$total_dirs] Processing: $dirname"
+    else
+        echo -ne "Progress: $current/$total_dirs directories\r"
+    fi
+    
+    # Create archive based on format
+    case "$FORMAT" in
+        zip)
+            if [ "$COMPRESS" = true ]; then
+                # Normal compression
+                if [ "$VERBOSE" = true ]; then
+                    zip -r "${dirname}.zip" "$dirname"
+                else
+                    zip -r "${dirname}.zip" "$dirname" > /dev/null
+                fi
+            else
+                # Zero compression for speed
+                if [ "$VERBOSE" = true ]; then
+                    zip -r -0 "${dirname}.zip" "$dirname"
+                else
+                    zip -r -0 "${dirname}.zip" "$dirname" > /dev/null
+                fi
+            fi
+            ;;
+        tar)
+            if [ "$VERBOSE" = true ]; then
+                tar -cf "${dirname}.tar" "$dirname"
+            else
+                tar -cf "${dirname}.tar" "$dirname" > /dev/null
+            fi
+            ;;
+        tgz)
+            if [ "$COMPRESS" = true ]; then
+                if [ "$VERBOSE" = true ]; then
+                    tar -czf "${dirname}.tgz" "$dirname"
+                else
+                    tar -czf "${dirname}.tgz" "$dirname" > /dev/null
+                fi
+            else
+                # Use minimal compression
+                if [ "$VERBOSE" = true ]; then
+                    tar -cf - "$dirname" | gzip -1 > "${dirname}.tgz"
+                else
+                    tar -cf - "$dirname" | gzip -1 > "${dirname}.tgz" 2> /dev/null
+                fi
+            fi
+            ;;
+    esac
+done
+
+# Clear the progress line and show completion message
+echo -ne "\033[K"  # Clear the line
+echo "Done! Created $total_dirs archives."

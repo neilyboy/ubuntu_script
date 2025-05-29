@@ -1,0 +1,171 @@
+#!/bin/bash
+# ----------------------------------------------------------------------
+# uploadem - File uploader for Gofile and BuzzHeavier
+# ----------------------------------------------------------------------
+# Created: $(date +"%Y-%m-%d")
+# Author: Cascade AI Assistant
+# ----------------------------------------------------------------------
+# Description:
+#   This script uploads files to both Gofile and BuzzHeavier (Eastern US)
+#   and outputs clean links.
+#
+# Usage:
+#   uploadem <file1> [file2 ...] or uploadem *.extension
+#   uploadem -r <file1> [file2 ...] - Use random filenames when uploading
+# ----------------------------------------------------------------------
+
+# Ensure safe handling of filenames with spaces/special chars
+IFS=$'\n\t'
+set -f  # Disable globbing
+
+# Eastern US server ID for BuzzHeavier
+BUZZHEAVIER_LOCATION_ID="12brteedoy0f"
+
+# Check for dependencies
+for cmd in curl jq; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: $cmd is required. Please install it." >&2
+        exit 1
+    fi
+done
+
+# Parse arguments
+USE_RANDOM_FILENAME=false
+
+# Check for flags
+while getopts ":r" opt; do
+    case $opt in
+        r)
+            USE_RANDOM_FILENAME=true
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            echo "Usage: uploadem <file1> [file2 ...] or uploadem *.extension"
+            echo "       uploadem -r <file1> [file2 ...] - Use random filenames when uploading"
+            exit 1
+            ;;
+    esac
+done
+
+# Shift to the actual file arguments
+shift $((OPTIND - 1))
+
+# Check for arguments
+if [ $# -eq 0 ]; then
+    echo "Usage: uploadem <file1> [file2 ...] or uploadem *.extension"
+    echo "       uploadem -r <file1> [file2 ...] - Use random filenames when uploading"
+    exit 1
+fi
+
+# Initialize variable to store all results
+ALL_RESULTS=""
+
+# Process each file
+for input_file in "$@"; do
+    if [ ! -f "$input_file" ]; then
+        echo "WARNING: File not found: $input_file" >&2
+        continue
+    fi
+
+    # Get filename and extension
+    filename=$(basename "$input_file")
+    filename_noext="${filename%.*}"
+    ext="${filename##*.}"
+    
+    echo
+    echo "==== Processing: $filename ===="
+    echo
+
+    # Determine which file to use for upload
+    if [ "$USE_RANDOM_FILENAME" = true ]; then
+        # Create a temporary file with a random name to avoid issues with special characters
+        temp_file="upload-$$.${ext}"
+        cp -- "$input_file" "$temp_file"
+        upload_file="$temp_file"
+        echo "Using random filename for upload: $(basename "$temp_file")" >&2
+    else
+        # Use the original file directly
+        upload_file="$input_file"
+        temp_file=""  # No temp file created
+    fi
+    
+    # --- GOFILE UPLOAD ---
+    echo -n "Uploading to Gofile... " >&2
+    
+    # Create anonymous Gofile session
+    gofile_account_json=$(curl -s -X POST "https://api.gofile.io/accounts")
+    gofile_token=$(echo "$gofile_account_json" | jq -r '.data.token')
+    gofile_root_folder=$(echo "$gofile_account_json" | jq -r '.data.rootFolder')
+    
+    # Get best server
+    gofile_servers_json=$(curl -s "https://api.gofile.io/servers")
+    gofile_server=$(echo "$gofile_servers_json" | jq -r '.data.servers[0].name')
+    
+    # Create folder
+    gofile_folder_json=$(curl -s -X POST -H "Authorization: Bearer $gofile_token" \
+                         -H "Referer: https://gofile.io/" \
+                         -H "Content-Type: application/json" \
+                         -d '{"parentFolderId":"'"$gofile_root_folder"'"}' \
+                         "https://api.gofile.io/contents/createfolder")
+    gofile_folder_id=$(echo "$gofile_folder_json" | jq -r '.data.id')
+    
+    # Set folder to public
+    curl -s -X PUT -H "Authorization: Bearer $gofile_token" \
+         -H "Referer: https://gofile.io/" \
+         -H "Content-Type: application/json" \
+         -d '{"attribute":"public","attributeValue":"true"}' \
+         "https://api.gofile.io/contents/$gofile_folder_id/update" > /dev/null
+    
+    # Upload file
+    gofile_upload_url="https://$gofile_server.gofile.io/contents/uploadFile"
+    gofile_upload_json=$(curl -s -X POST -H "Authorization: Bearer $gofile_token" \
+                         -H "Referer: https://gofile.io/" \
+                         -F "file=@$upload_file" \
+                         -F "folderId=$gofile_folder_id" \
+                         "$gofile_upload_url")
+    
+    gofile_status=$(echo "$gofile_upload_json" | jq -r '.status')
+    
+    if [ "$gofile_status" != "ok" ]; then
+        gofile_link="[GOFILE UPLOAD FAILED]"
+    else
+        gofile_link=$(echo "$gofile_upload_json" | jq -r '.data.downloadPage')
+    fi
+    echo "Done" >&2
+    
+    # --- BUZZHEAVIER UPLOAD ---
+    echo -n "Uploading to BuzzHeavier... " >&2
+    
+    # Upload to BuzzHeavier
+    buzz_url="https://w.buzzheavier.com/$(basename "$upload_file")?locationId=$BUZZHEAVIER_LOCATION_ID"
+    buzz_response=$(curl -s -T "$upload_file" "$buzz_url")
+    
+    if echo "$buzz_response" | grep -qi 'error\|denied\|fail'; then
+        buzz_link="[BUZZHEAVIER UPLOAD FAILED]"
+    elif echo "$buzz_response" | grep -q '"id"'; then
+        buzz_id=$(echo "$buzz_response" | jq -r '.data.id')
+        if [ "$buzz_id" != "null" ] && [ -n "$buzz_id" ]; then
+            buzz_link="https://buzzheavier.com/$buzz_id"
+        else
+            buzz_link="[BUZZHEAVIER UNKNOWN RESPONSE]"
+        fi
+    else
+        buzz_link="[BUZZHEAVIER UNKNOWN RESPONSE]"
+    fi
+    echo "Done" >&2
+    
+    # Clean up temp file if one was created
+    if [ -n "$temp_file" ] && [ -f "$temp_file" ]; then
+        rm -f "$temp_file"
+    fi
+    
+    # Store the results instead of outputting immediately
+    RESULT="$filename_noext\n$gofile_link\n$buzz_link\n"
+    ALL_RESULTS="${ALL_RESULTS}${RESULT}\n"
+done
+
+# Output all results at the end for easy copying
+echo -e "\n\n"
+echo -e "$ALL_RESULTS"
+
+exit 0
