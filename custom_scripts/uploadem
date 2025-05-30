@@ -296,34 +296,149 @@ for input_file in "$@"; do
     touch "${buzz_progress_log}.progress"
     
     # Upload to BuzzHeavier with progress
-    # URL encode the filename to handle spaces and special characters
-    encoded_filename=$(urlencode "$(basename "$upload_file")")
-    buzz_url="https://w.buzzheavier.com/${encoded_filename}?locationId=$BUZZHEAVIER_LOCATION_ID"
-    (
-        # Use stdbuf to ensure output is not buffered
-        curl --no-buffer -# -T "$upload_file" "$buzz_url" 2> "$buzz_progress_log" | tee "${buzz_progress_log}.json" > /dev/null
-        rm -f "${buzz_progress_log}.progress"
-    ) &
+    # Create debug log directory if it doesn't exist
+    mkdir -p /tmp/uploadem_debug
+    debug_file="/tmp/uploadem_debug/$(date +%Y%m%d_%H%M%S)_$(basename "$upload_file").log"
+    echo "[DEBUG] Starting BuzzHeavier upload for: $(basename "$upload_file")" > "$debug_file"
+    echo "[DEBUG] File extension: ${ext}" >> "$debug_file"
+    echo "[DEBUG] File size: $file_size bytes ($formatted_size)" >> "$debug_file"
+    
+    # For zip files, we'll use the same approach as non-zip files but with some modifications
+    if [[ "${ext,,}" == "zip" ]]; then
+        # For zip files, try the standard method but with some tweaks
+        # Create a temporary directory for debugging
+        mkdir -p /tmp/uploadem_debug
+        debug_file="/tmp/uploadem_debug/$(date +%Y%m%d_%H%M%S)_$(basename "$upload_file").log"
+        echo "[DEBUG] Starting BuzzHeavier upload for ZIP file: $(basename "$upload_file")" > "$debug_file"
+        
+        # URL encode the filename to handle spaces and special characters
+        # For zip files, we'll simplify the filename to avoid issues
+        # Create a temporary file with a simplified name
+        temp_dir=$(mktemp -d -p /tmp uploadem-XXXXXX)
+        simple_name="$(echo "${filename_noext}" | tr -dc 'a-zA-Z0-9' | head -c 20).zip"
+        cp "$upload_file" "$temp_dir/$simple_name"
+        echo "[DEBUG] Created simplified filename: $simple_name" >> "$debug_file"
+        
+        # Use the simplified file for upload
+        encoded_filename=$(urlencode "$simple_name")
+        buzz_url="https://w.buzzheavier.com/${encoded_filename}?locationId=$BUZZHEAVIER_LOCATION_ID"
+        echo "[DEBUG] Using URL: $buzz_url" >> "$debug_file"
+        
+        (
+            # Use stdbuf to ensure output is not buffered
+            curl --no-buffer -# -T "$temp_dir/$simple_name" "$buzz_url" 2> "$buzz_progress_log" | tee "${buzz_progress_log}.json" > /dev/null
+            echo "[DEBUG] BuzzHeavier upload complete with status: $?" >> "$debug_file"
+            rm -f "${buzz_progress_log}.progress"
+            # Clean up temp file
+            rm -rf "$temp_dir"
+        ) &
+    else
+        # Standard upload method for non-zip files
+        encoded_filename=$(urlencode "$(basename "$upload_file")")
+        buzz_url="https://w.buzzheavier.com/${encoded_filename}?locationId=$BUZZHEAVIER_LOCATION_ID"
+        
+        # Create debug log directory if it doesn't exist
+        mkdir -p /tmp/uploadem_debug
+        debug_file="/tmp/uploadem_debug/$(date +%Y%m%d_%H%M%S)_$(basename "$upload_file").log"
+        echo "[DEBUG] Starting BuzzHeavier upload for: $(basename "$upload_file")" > "$debug_file"
+        echo "[DEBUG] Using URL: $buzz_url" >> "$debug_file"
+        
+        (
+            # Use stdbuf to ensure output is not buffered
+            curl --no-buffer -# -T "$upload_file" "$buzz_url" 2> "$buzz_progress_log" | tee "${buzz_progress_log}.json" > /dev/null
+            echo "[DEBUG] BuzzHeavier upload complete with status: $?" >> "$debug_file"
+            rm -f "${buzz_progress_log}.progress"
+        ) &
+    fi
     
     # Display progress
     display_progress "BuzzHeavier" "$buzz_progress_log" "$file_size" "$formatted_size" >&2
     
     # Wait for upload to complete and process response
     wait
-    buzz_response=$(cat "${buzz_progress_log}.json")
+    buzz_response=$(cat "${buzz_progress_log}.json" 2>/dev/null || echo "")
     
-    if echo "$buzz_response" | grep -qi 'error\|denied\|fail'; then
-        buzz_link="[BUZZHEAVIER UPLOAD FAILED]"
-    elif echo "$buzz_response" | grep -q '"id"'; then
+    # Save response to debug file
+    echo "[DEBUG] BuzzHeavier Raw Response: '$buzz_response'" >> "$debug_file"
+    
+    # Try to determine if it's valid JSON
+    if echo "$buzz_response" | jq . &>/dev/null; then
+        echo "[DEBUG] Response is valid JSON" >> "$debug_file"
+        # Pretty print JSON for better readability in debug
+        echo "[DEBUG] JSON Content:" >> "$debug_file"
+        echo "$buzz_response" | jq . >> "$debug_file" 2>/dev/null
+    else
+        echo "[DEBUG] Response is not valid JSON" >> "$debug_file"
+    fi
+    
+    # For both .zip and non-zip files, use a more robust response parsing approach
+    echo "[DEBUG] Processing BuzzHeavier response" >> "$debug_file"
+    echo "[DEBUG] File extension: ${ext}" >> "$debug_file"
+    
+    # Check if response contains a direct URL pattern
+    if [[ "$buzz_response" =~ https?://buzzheavier\.com/[a-zA-Z0-9]+ ]]; then
+        # Extract the complete URL with regex
+        buzz_url=$(echo "$buzz_response" | grep -o 'https\?://buzzheavier\.com/[a-zA-Z0-9]\+' | grep -v 'api$' | head -1)
+        echo "[DEBUG] Found direct BuzzHeavier URL in response: $buzz_url" >> "$debug_file"
+        buzz_link="$buzz_url"
+        
+    # Check if it's a JSON response with an ID field
+    elif echo "$buzz_response" | jq -e '.data.id' &>/dev/null; then
         buzz_id=$(echo "$buzz_response" | jq -r '.data.id')
+        echo "[DEBUG] Found file ID in JSON response: $buzz_id" >> "$debug_file"
         if [ "$buzz_id" != "null" ] && [ -n "$buzz_id" ]; then
             buzz_link="https://buzzheavier.com/$buzz_id"
         else
-            buzz_link="[BUZZHEAVIER UNKNOWN RESPONSE]"
+            buzz_link="[BUZZHEAVIER INVALID ID IN RESPONSE]"
         fi
+        
+    # Check debug logs for URLs or file IDs
     else
-        buzz_link="[BUZZHEAVIER UNKNOWN RESPONSE]"
+        echo "[DEBUG] Checking debug logs for BuzzHeavier information" >> "$debug_file"
+        
+        # First try to find any valid BuzzHeavier URL in the logs (avoiding api URLs)
+        buzz_url=$(grep -o 'https\?://buzzheavier\.com/[a-zA-Z0-9]\+' "$debug_file" | grep -v 'api$' | head -1)
+        if [[ -n "$buzz_url" ]]; then
+            echo "[DEBUG] Found BuzzHeavier URL in debug logs: $buzz_url" >> "$debug_file"
+            buzz_link="$buzz_url"
+            
+        # Check for a file ID pattern in the response
+        elif [[ "$buzz_response" =~ \"id\":\"([a-zA-Z0-9]+)\" ]]; then
+            buzz_id="${BASH_REMATCH[1]}"
+            echo "[DEBUG] Extracted file ID from response: $buzz_id" >> "$debug_file"
+            buzz_link="https://buzzheavier.com/$buzz_id"
+            
+        # Look for "< Location: " headers in debug logs for .zip files
+        elif grep -q 'Location:' "$debug_file"; then
+            location_url=$(grep -o 'Location: https\?://buzzheavier\.com/[a-zA-Z0-9]\+' "$debug_file" | head -1 | sed 's|Location: ||')
+            if [[ -n "$location_url" ]]; then
+                echo "[DEBUG] Found BuzzHeavier URL in Location header: $location_url" >> "$debug_file"
+                buzz_link="$location_url"
+            else
+                echo "[DEBUG] Found Location header but no valid URL" >> "$debug_file"
+                buzz_link="[BUZZHEAVIER UPLOAD FAILED - CHECK LOGS]"
+            fi
+        else
+            # Final fallback - use simplified name to construct URL for .zip files
+            if [[ "${ext,,}" == "zip" ]] && [[ -n "$simple_name" ]]; then
+                # This is a bit of a hack, but sometimes BuzzHeavier doesn't return proper URLs for .zip files
+                # Try to find any upload ID from the curl verbose output
+                upload_id=$(grep -o '\[upload\] [0-9]\+' "$debug_file" | head -1 | awk '{print $2}')
+                if [[ -n "$upload_id" ]]; then
+                    echo "[DEBUG] Found upload ID in curl output: $upload_id" >> "$debug_file"
+                    buzz_link="https://buzzheavier.com/$upload_id"
+                else
+                    echo "[DEBUG] No upload ID found, BuzzHeavier likely failed" >> "$debug_file"
+                    buzz_link="[BUZZHEAVIER UPLOAD FAILED - NO VALID RESPONSE]"
+                fi
+            else
+                echo "[DEBUG] Could not find any BuzzHeavier URL or ID" >> "$debug_file"
+                buzz_link="[BUZZHEAVIER UPLOAD FAILED]"
+            fi
+        fi
     fi
+    
+    echo "[DEBUG] Final BuzzHeavier link: $buzz_link" >> "$debug_file"
     
     # Clean up temp files
     rm -f "$buzz_progress_log" "${buzz_progress_log}.json"
